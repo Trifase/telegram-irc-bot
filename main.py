@@ -1,11 +1,10 @@
 import asyncio
-import logging
 from typing import Optional
 import config
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-
+# No logging configuration needed
 
 class IRCClient:
     def __init__(self, server: str, port: int, nick: str, channel: str, bridge):
@@ -18,6 +17,8 @@ class IRCClient:
         self.writer: Optional[asyncio.StreamWriter] = None
         self.connected = False
         self.joined = False
+        self.channel_users = []  # Store current channel users
+        self.names_pending = False  # Track if we're waiting for NAMES response
     
     async def connect(self):
         """Connect to IRC server"""
@@ -25,7 +26,7 @@ class IRCClient:
             self.reader, self.writer = await asyncio.open_connection(self.server, self.port)
             self.connected = True
             print(f"Connected to IRC server: {self.server}:{self.port}")
-
+            
             # Send registration
             await self.send_raw(f"NICK {self.nick}")
             await self.send_raw(f"USER {self.nick} 0 * :{self.nick}")
@@ -42,7 +43,7 @@ class IRCClient:
         if self.writer and not self.writer.is_closing():
             self.writer.write(f"{message}\r\n".encode())
             await self.writer.drain()
-            print(f"IRC >> {message}")
+            # print(f"IRC >> {message}")  # Uncomment for debug
     
     async def join_channel(self):
         """Join the specified channel"""
@@ -52,6 +53,15 @@ class IRCClient:
     async def send_privmsg(self, target: str, message: str):
         """Send PRIVMSG to channel or user"""
         await self.send_raw(f"PRIVMSG {target} :{message}")
+    
+    async def request_names(self):
+        """Request list of users in channel"""
+        if self.connected and self.joined:
+            self.names_pending = True
+            self.channel_users = []  # Clear current list
+            await self.send_raw(f"NAMES {self.channel}")
+            return True
+        return False
     
     async def handle_messages(self):
         """Handle incoming IRC messages"""
@@ -65,7 +75,7 @@ class IRCClient:
                 if not message:
                     continue
                 
-                print(f"IRC << {message}")
+                # print(f"IRC << {message}")  # Uncomment for debug
                 await self.process_message(message)
                 
         except Exception as e:
@@ -91,9 +101,26 @@ class IRCClient:
             if parts[1] == '001':  # Welcome message
                 print("IRC registration successful")
                 await self.join_channel()
-            elif parts[1] == '366':  # End of NAMES list (joined channel)
-                self.joined = True
-                print(f"Successfully joined {self.channel}")
+            elif parts[1] == '353':  # NAMES reply
+                # Format: :server 353 nick = #channel :user1 user2 user3...
+                if len(parts) >= 4:
+                    users_str = parts[3][1:]  # Remove leading ':'
+                    users = users_str.split()
+                    # Keep all prefixes (@, +, %, etc.) to show user privileges
+                    self.channel_users.extend(users)
+                    # print(f"NAMES response: {users}")  # Uncomment for debug
+            elif parts[1] == '366':  # End of NAMES list
+                if self.names_pending:
+                    # Send the complete user list to Telegram
+                    self.names_pending = False
+                    user_count = len(self.channel_users)
+                    users_text = ', '.join(sorted(self.channel_users))
+                    response = f"📋 Users in {self.channel} ({user_count}):\n{users_text}"
+                    await self.bridge.send_to_telegram(response)
+                else:
+                    # This is from joining the channel
+                    self.joined = True
+                    print(f"Successfully joined {self.channel}")
             elif parts[1] == 'PRIVMSG' and len(parts) >= 4:
                 # Parse PRIVMSG
                 source = parts[0][1:]  # Remove leading ':'
@@ -107,6 +134,31 @@ class IRCClient:
                 if target == self.channel and nick != self.nick:
                     formatted_msg = f"<{nick}> {msg_content}"
                     await self.bridge.send_to_telegram(formatted_msg)
+            elif parts[1] == 'JOIN':
+                # Someone joined the channel
+                source = parts[0][1:]  # Remove leading ':'
+                nick = source.split('!')[0] if '!' in source else source
+                if len(parts) >= 3:
+                    channel = parts[2]
+                    if channel == self.channel and nick != self.nick:
+                        join_msg = f"[IRC] → {nick} joined {channel}"
+                        await self.bridge.send_to_telegram(join_msg)
+            elif parts[1] == 'PART':
+                # Someone left the channel
+                source = parts[0][1:]  # Remove leading ':'
+                nick = source.split('!')[0] if '!' in source else source
+                if len(parts) >= 3:
+                    channel = parts[2]
+                    if channel == self.channel and nick != self.nick:
+                        part_msg = f"[IRC] ← {nick} left {channel}"
+                        await self.bridge.send_to_telegram(part_msg)
+            elif parts[1] == 'QUIT':
+                # Someone quit IRC
+                source = parts[0][1:]  # Remove leading ':'
+                nick = source.split('!')[0] if '!' in source else source
+                quit_reason = parts[2][1:] if len(parts) >= 3 else "No reason"
+                quit_msg = f"[IRC] ← {nick} quit ({quit_reason})"
+                await self.bridge.send_to_telegram(quit_msg)
     
     async def disconnect(self):
         """Disconnect from IRC"""
@@ -134,6 +186,8 @@ class TelegramIRCBridge:
         # Setup Telegram handlers
         self.telegram_app.add_handler(CommandHandler("start", self.start_command))
         self.telegram_app.add_handler(CommandHandler("status", self.status_command))
+        self.telegram_app.add_handler(CommandHandler("names", self.names_command))
+        self.telegram_app.add_handler(CommandHandler("list", self.names_command))  # Alias for names
         self.telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_telegram_message))
     
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -142,6 +196,21 @@ class TelegramIRCBridge:
             f"Telegram-IRC Bridge Bot is running!\n"
             f"Bridging with: {self.irc_channel} on {self.irc_server}"
         )
+    
+    async def names_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /names or /list command"""
+        if update.effective_chat.id != self.telegram_chat_id:
+            await update.message.reply_text("This command only works in the bridged group.")
+            return
+        
+        if self.irc_client and self.irc_client.connected and self.irc_client.joined:
+            success = await self.irc_client.request_names()
+            if success:
+                await update.message.reply_text(f"🔄 Requesting user list for {self.irc_channel}...")
+            else:
+                await update.message.reply_text("❌ Failed to request user list.")
+        else:
+            await update.message.reply_text("❌ IRC not connected or not joined to channel.")
     
     async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /status command"""
@@ -165,12 +234,12 @@ class TelegramIRCBridge:
         
         if self.irc_client and self.irc_client.connected and self.irc_client.joined:
             message = update.message.text
-            sender = update.effective_user.first_name or update.effective_user.username or "Unknown"
+            # sender = update.effective_user.first_name or update.effective_user.username or "Unknown"
             
             # Format message for IRC
             irc_message = f"{message}"
             await self.irc_client.send_privmsg(self.irc_channel, irc_message)
-            print(f"Relayed to IRC: {irc_message}")
+            print(f"→ IRC: {irc_message}")
         else:
             print("IRC not connected, cannot relay message")
     
@@ -181,7 +250,7 @@ class TelegramIRCBridge:
                 chat_id=self.telegram_chat_id,
                 text=message
             )
-            print(f"Relayed to Telegram: {message}")
+            print(f"← Telegram: {message}")
         except Exception as e:
             print(f"Failed to send message to Telegram: {e}")
     
@@ -219,10 +288,10 @@ class TelegramIRCBridge:
 
 
 async def main():
-    # Configuration
+    # Configuration from config module
     TELEGRAM_TOKEN = config.TELEGRAM_TOKEN
     TELEGRAM_CHAT_ID = config.TELEGRAM_CHAT_ID
-
+    
     IRC_SERVER = config.IRC_SERVER
     IRC_PORT = config.IRC_PORT
     IRC_NICK = config.IRC_NICK
@@ -246,4 +315,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("Bot stopped by user")
-
