@@ -1,0 +1,7 @@
+TELEGRAM_TOKEN = "123456789:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+TELEGRAM_CHAT_ID = -123456789  # Your Telegram group chat ID (negative for groups)
+
+IRC_SERVER = "irc.libera.chat"  # Example: Libera.Chat
+IRC_PORT = 6667
+IRC_NICK = "PenguinOfDoom"
+IRC_CHANNEL = "#italyfinance"
