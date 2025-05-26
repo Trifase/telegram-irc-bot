@@ -5,3 +5,4 @@ IRC_SERVER = "irc.libera.chat"  # Example: Libera.Chat
 IRC_PORT = 6667
 IRC_NICK = "PenguinOfDoom"
 IRC_CHANNEL = "#italyfinance"
+# NICKSERV_PASSWORD = "your_nickserv_password"  # If you use NickServ, set your password here - if you don't use NickServ, comment it
