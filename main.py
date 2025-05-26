@@ -1,5 +1,7 @@
 import asyncio
 from typing import Optional
+import socket
+import ssl
 import config
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -7,12 +9,13 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 # No logging configuration needed
 
 class IRCClient:
-    def __init__(self, server: str, port: int, nick: str, channel: str, bridge):
+    def __init__(self, server: str, port: int, nick: str, channel: str, bridge, nickserv_password: str = None):
         self.server = server
         self.port = port
         self.nick = nick
         self.channel = channel
         self.bridge = bridge
+        self.nickserv_password = nickserv_password
         self.reader: Optional[asyncio.StreamReader] = None
         self.writer: Optional[asyncio.StreamWriter] = None
         self.connected = False
@@ -63,6 +66,12 @@ class IRCClient:
             return True
         return False
     
+    async def identify_nickserv(self):
+        """Identify with NickServ using password"""
+        if self.nickserv_password:
+            await self.send_raw(f"PRIVMSG NickServ :IDENTIFY {self.nick} {self.nickserv_password}")
+            print(f"Sent IDENTIFY command to NickServ for {self.nick}")
+    
     async def handle_messages(self):
         """Handle incoming IRC messages"""
         try:
@@ -100,6 +109,9 @@ class IRCClient:
             # Handle numeric responses
             if parts[1] == '001':  # Welcome message
                 print("IRC registration successful")
+                # Identify with NickServ if password is provided
+                if self.nickserv_password:
+                    await self.identify_nickserv()
                 await self.join_channel()
             elif parts[1] == '353':  # NAMES reply
                 # Format: :server 353 nick = #channel :user1 user2 user3...
@@ -171,13 +183,15 @@ class IRCClient:
 
 class TelegramIRCBridge:
     def __init__(self, telegram_token: str, irc_server: str, irc_port: int, 
-                 irc_nick: str, irc_channel: str, telegram_chat_id: int):
+                 irc_nick: str, irc_channel: str, telegram_chat_id: int, 
+                 nickserv_password: str = None):
         self.telegram_token = telegram_token
         self.irc_server = irc_server
         self.irc_port = irc_port
         self.irc_nick = irc_nick
         self.irc_channel = irc_channel
         self.telegram_chat_id = telegram_chat_id
+        self.nickserv_password = nickserv_password
         
         # Initialize Telegram bot
         self.telegram_app = Application.builder().token(telegram_token).build()
@@ -257,7 +271,8 @@ class TelegramIRCBridge:
     async def start_irc_client(self):
         """Start the IRC client"""
         self.irc_client = IRCClient(
-            self.irc_server, self.irc_port, self.irc_nick, self.irc_channel, self
+            self.irc_server, self.irc_port, self.irc_nick, self.irc_channel, 
+            self, self.nickserv_password
         )
         await self.irc_client.connect()
         
@@ -297,6 +312,9 @@ async def main():
     IRC_NICK = config.IRC_NICK
     IRC_CHANNEL = config.IRC_CHANNEL
     
+    # Optional NickServ password (can be None if not needed)
+    NICKSERV_PASSWORD = getattr(config, 'NICKSERV_PASSWORD', None)
+    
     # Create and run the bridge
     bridge = TelegramIRCBridge(
         telegram_token=TELEGRAM_TOKEN,
@@ -304,7 +322,8 @@ async def main():
         irc_port=IRC_PORT,
         irc_nick=IRC_NICK,
         irc_channel=IRC_CHANNEL,
-        telegram_chat_id=TELEGRAM_CHAT_ID
+        telegram_chat_id=TELEGRAM_CHAT_ID,
+        nickserv_password=NICKSERV_PASSWORD
     )
     
     await bridge.run()
