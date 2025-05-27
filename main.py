@@ -22,6 +22,8 @@ class IRCClient:
         self.joined = False
         self.channel_users = []  # Store current channel users
         self.names_pending = False  # Track if we're waiting for NAMES response
+        self.channel_topic = ""  # Store current channel topic
+        self.topic_pending = False  # Track if we're waiting for TOPIC response
     
     async def connect(self):
         """Connect to IRC server"""
@@ -63,6 +65,14 @@ class IRCClient:
             self.names_pending = True
             self.channel_users = []  # Clear current list
             await self.send_raw(f"NAMES {self.channel}")
+            return True
+        return False
+    
+    async def request_topic(self):
+        """Request current channel topic"""
+        if self.connected and self.joined:
+            self.topic_pending = True
+            await self.send_raw(f"TOPIC {self.channel}")
             return True
         return False
     
@@ -113,6 +123,28 @@ class IRCClient:
                 if self.nickserv_password:
                     await self.identify_nickserv()
                 await self.join_channel()
+            elif parts[1] == '332':  # Topic reply (RPL_TOPIC)
+                # Format: :server 332 nick #channel :topic text
+                if len(parts) >= 4:
+                    topic_text = parts[3][1:]  # Remove leading ':'
+                    self.channel_topic = topic_text
+                    if self.topic_pending:
+                        # This is a response to our TOPIC request
+                        self.topic_pending = False
+                        response = f"📌 Topic for {self.channel}:\n{topic_text}"
+                        await self.bridge.send_to_telegram(response)
+                    # print(f"Topic set: {topic_text}")  # Uncomment for debug
+            elif parts[1] == '331':  # No topic set (RPL_NOTOPIC)
+                # Format: :server 331 nick #channel :No topic is set
+                self.channel_topic = ""
+                if self.topic_pending:
+                    self.topic_pending = False
+                    response = f"📌 No topic is set for {self.channel}"
+                    await self.bridge.send_to_telegram(response)
+            elif parts[1] == '333':  # Topic info (RPL_TOPICWHOTIME)
+                # Format: :server 333 nick #channel setter timestamp
+                # This comes after 332, we can ignore it or use it for additional info
+                pass
             elif parts[1] == '353':  # NAMES reply
                 # Format: :server 353 nick = #channel :user1 user2 user3...
                 if len(parts) >= 4:
@@ -133,6 +165,8 @@ class IRCClient:
                     # This is from joining the channel
                     self.joined = True
                     print(f"Successfully joined {self.channel}")
+                    # Request topic after joining
+                    await self.request_topic()
             elif parts[1] == 'PRIVMSG' and len(parts) >= 4:
                 # Parse PRIVMSG
                 source = parts[0][1:]  # Remove leading ':'
@@ -146,6 +180,25 @@ class IRCClient:
                 if target == self.channel and nick != self.nick:
                     formatted_msg = f"<{nick}> {msg_content}"
                     await self.bridge.send_to_telegram(formatted_msg)
+            elif parts[1] == 'TOPIC':
+                # Topic change
+                # Format: :nick!user@host TOPIC #channel :new topic
+                source = parts[0][1:]  # Remove leading ':'
+                nick = source.split('!')[0] if '!' in source else source
+                if len(parts) >= 4:
+                    channel = parts[2]
+                    new_topic = parts[3][1:]  # Remove leading ':'
+                    if channel == self.channel:
+                        self.channel_topic = new_topic
+                        topic_msg = f"📌 {nick} changed topic to: {new_topic}"
+                        await self.bridge.send_to_telegram(topic_msg)
+                elif len(parts) >= 3:
+                    # Topic removed (no topic text)
+                    channel = parts[2]
+                    if channel == self.channel:
+                        self.channel_topic = ""
+                        topic_msg = f"📌 {nick} removed the topic"
+                        await self.bridge.send_to_telegram(topic_msg)
             elif parts[1] == 'JOIN':
                 # Someone joined the channel
                 source = parts[0][1:]  # Remove leading ':'
@@ -202,13 +255,18 @@ class TelegramIRCBridge:
         self.telegram_app.add_handler(CommandHandler("status", self.status_command))
         self.telegram_app.add_handler(CommandHandler("names", self.names_command))
         self.telegram_app.add_handler(CommandHandler("list", self.names_command))  # Alias for names
+        self.telegram_app.add_handler(CommandHandler("topic", self.topic_command))
         self.telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_telegram_message))
     
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /start command"""
         await update.message.reply_text(
             f"Telegram-IRC Bridge Bot is running!\n"
-            f"Bridging with: {self.irc_channel} on {self.irc_server}"
+            f"Bridging with: {self.irc_channel} on {self.irc_server}\n\n"
+            f"Available commands:\n"
+            f"/status - Show connection status\n"
+            f"/names or /list - Show channel users\n"
+            f"/topic - Show current channel topic"
         )
     
     async def names_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -226,16 +284,33 @@ class TelegramIRCBridge:
         else:
             await update.message.reply_text("❌ IRC not connected or not joined to channel.")
     
+    async def topic_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /topic command"""
+        if update.effective_chat.id != self.telegram_chat_id:
+            await update.message.reply_text("This command only works in the bridged group.")
+            return
+        
+        if self.irc_client and self.irc_client.connected and self.irc_client.joined:
+            success = await self.irc_client.request_topic()
+            if success:
+                await update.message.reply_text(f"🔄 Requesting topic for {self.irc_channel}...")
+            else:
+                await update.message.reply_text("❌ Failed to request topic.")
+        else:
+            await update.message.reply_text("❌ IRC not connected or not joined to channel.")
+    
     async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /status command"""
         if self.irc_client:
             status = "Connected" if self.irc_client.connected else "Disconnected"
             joined = "Yes" if self.irc_client.joined else "No"
+            topic = self.irc_client.channel_topic if self.irc_client.channel_topic else "No topic set"
             await update.message.reply_text(
                 f"IRC Status: {status}\n"
                 f"Channel Joined: {joined}\n"
                 f"Server: {self.irc_server}:{self.irc_port}\n"
-                f"Channel: {self.irc_channel}"
+                f"Channel: {self.irc_channel}\n"
+                f"Topic: {topic}"
             )
         else:
             await update.message.reply_text("IRC client not initialized")
