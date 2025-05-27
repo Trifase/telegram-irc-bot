@@ -1,10 +1,20 @@
 import asyncio
+import base64
+import os
+import tempfile
 from typing import Optional
-import socket
-import ssl
-import config
+
+import requests
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+
+import config
 
 # No logging configuration needed
 
@@ -107,6 +117,7 @@ class IRCClient:
     
     async def process_message(self, message: str):
         """Process IRC message"""
+        # print(f"Processing message: {message}")  # Debug output
         parts = message.split(' ', 3)
         
         if message.startswith('PING'):
@@ -169,16 +180,20 @@ class IRCClient:
                     await self.request_topic()
             elif parts[1] == 'PRIVMSG' and len(parts) >= 4:
                 # Parse PRIVMSG
+                # print(parts)
                 source = parts[0][1:]  # Remove leading ':'
                 target = parts[2]
                 msg_content = parts[3][1:]  # Remove leading ':'
                 
                 # Extract nickname from source
                 nick = source.split('!')[0] if '!' in source else source
-                
                 # Only relay messages from our channel that aren't from us
                 if target == self.channel and nick != self.nick:
                     formatted_msg = f"<{nick}> {msg_content}"
+                    if 'ACTION ' in msg_content and '\x01' in msg_content:
+                        action_text = msg_content.split(' ', 1)[-1][:-1]  # Remove trailing '\x01'
+                        print(f"Action from {nick} in {target}: {action_text}")
+                        formatted_msg = f"*{nick} {action_text}"
                     await self.bridge.send_to_telegram(formatted_msg)
             elif parts[1] == 'TOPIC':
                 # Topic change
@@ -229,7 +244,7 @@ class IRCClient:
         """Disconnect from IRC"""
         self.connected = False
         if self.writer:
-            await self.send_raw("QUIT :Bridge bot disconnecting")
+            await self.send_raw("QUIT :Ritorneremo")
             self.writer.close()
             await self.writer.wait_closed()
 
@@ -257,6 +272,7 @@ class TelegramIRCBridge:
         self.telegram_app.add_handler(CommandHandler("list", self.names_command))  # Alias for names
         self.telegram_app.add_handler(CommandHandler("topic", self.topic_command))
         self.telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_telegram_message))
+        self.telegram_app.add_handler(MessageHandler(filters.PHOTO, self.handle_telegram_photo))
     
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /start command"""
@@ -315,6 +331,31 @@ class TelegramIRCBridge:
         else:
             await update.message.reply_text("IRC client not initialized")
     
+    async def handle_telegram_photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle photos from Telegram and relay to IRC"""
+
+        # Only process messages from the configured chat
+        if update.effective_chat.id != self.telegram_chat_id:
+            return
+
+        # If this is None, file upload is disabled
+        IMGBB_API_KEY = getattr(config, 'IMGBB_API_KEY', None)
+
+        
+        if self.irc_client and self.irc_client.connected and self.irc_client.joined and IMGBB_API_KEY:
+
+            with tempfile.NamedTemporaryFile(suffix=".jpg") as tempphoto:
+                picture = update.message.photo[-1]
+                actual_picture = await picture.get_file()
+                await actual_picture.download_to_drive(custom_path=tempphoto.name)
+                img_url = upload_image_to_imgbb(tempphoto.name, IMGBB_API_KEY)
+
+            if img_url:
+                await self.irc_client.send_privmsg(self.irc_channel, img_url)
+                print(f"→ IRC: {img_url}")
+        else:
+            print("IRC not connected, cannot relay message")
+
     async def handle_telegram_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle messages from Telegram and relay to IRC"""
         # Only process messages from the configured chat
@@ -323,10 +364,14 @@ class TelegramIRCBridge:
         
         if self.irc_client and self.irc_client.connected and self.irc_client.joined:
             message = update.message.text
+
             # sender = update.effective_user.first_name or update.effective_user.username or "Unknown"
             
             # Format message for IRC
             irc_message = f"{message}"
+            if update.message and update.message.reply_to_message  and update.message.reply_to_message.text:
+                # If this is a reply, include the original message
+               irc_message = f"{update.message.reply_to_message.text} → {irc_message}"
             await self.irc_client.send_privmsg(self.irc_channel, irc_message)
             print(f"→ IRC: {irc_message}")
         else:
@@ -376,6 +421,67 @@ class TelegramIRCBridge:
                 await self.irc_client.disconnect()
             await self.telegram_app.stop()
 
+
+def upload_image_to_imgbb(image_path, api_key):
+    """
+    Uploads an image to ImgBB and returns its public URL.
+
+    Args:
+        image_path (str): The path to the image file you want to upload.
+        api_key (str): Your ImgBB API key.
+
+    Returns:
+        str: The public URL of the uploaded image, or None if the upload fails.
+    """
+    if not os.path.exists(image_path):
+        print(f"Error: Image file not found at '{image_path}'")
+        return None
+
+    # ImgBB API endpoint for uploads
+    upload_url = "https://api.imgbb.com/1/upload"
+
+    try:
+        # Read the image file in binary mode
+        with open(image_path, "rb") as f:
+            image_data = f.read()
+
+        # Encode the image data to base64
+        # ImgBB API accepts base64 encoded image data or a direct file upload
+        # Using base64 is often more straightforward for simple scripts
+        encoded_image = base64.b64encode(image_data).decode('utf-8')
+
+        # Prepare the payload for the POST request
+        # 'key' is your API key
+        # 'image' is the base64 encoded image data
+        payload = {
+            "key": api_key,
+            "image": encoded_image
+        }
+
+        # Send the POST request to ImgBB
+        print(f"Uploading '{image_path}' to ImgBB...")
+        response = requests.post(upload_url, data=payload)
+        response.raise_for_status()  # Raise an exception for HTTP errors (4xx or 5xx)
+
+        # Parse the JSON response
+        result = response.json()
+
+        # Check if the upload was successful and get the URL
+        if result.get("success"):
+            public_url = result["data"]["url"]
+            print(f"Image uploaded successfully! Public URL: {public_url}")
+            return public_url
+        else:
+            error_message = result.get("error", "Unknown error during upload.")
+            print(f"Image upload failed: {error_message}")
+            return None
+
+    except requests.exceptions.RequestException as e:
+        print(f"Network or API error: {e}")
+        return None
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+        return None
 
 async def main():
     # Configuration from config module

@@ -5,4 +5,6 @@ IRC_SERVER = "irc.libera.chat"  # Example: Libera.Chat
 IRC_PORT = 6667
 IRC_NICK = "PenguinOfDoom"
 IRC_CHANNEL = "#italyfinance"
+
+# IMGBB_API_KEY = "ASJKDNHJK12n1kjnk2"  # Your IMGBB API key for image uploads - if you don't use it, comment it
 # NICKSERV_PASSWORD = "your_nickserv_password"  # If you use NickServ, set your password here - if you don't use NickServ, comment it
